@@ -1,0 +1,3 @@
+[submodule ".claude/plugins/enfold-llm"]
+	path = .claude/plugins/enfold-llm
+	url = https://github.com/tuvens/enfold-llm.git

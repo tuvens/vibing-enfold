@@ -1,0 +1,17 @@
+{
+  "_comment": "Copy to .claude-wp.json and customize. This file is gitignored.",
+  "site": {
+    "name": "My Website",
+    "production_url": "https://your-site.com",
+    "staging_url": "https://staging.your-site.com"
+  },
+  "wordpress": {
+    "username": "",
+    "application_password": ""
+  },
+  "paths": {
+    "content": "content/",
+    "meta": "meta/",
+    "theme": "theme/"
+  }
+}

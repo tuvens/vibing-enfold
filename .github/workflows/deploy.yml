@@ -1,0 +1,283 @@
+name: Deploy to WordPress
+
+on:
+  push:
+    branches:
+      # TODO: Uncomment 'main' after validating workflow on staging
+      # - main
+      - staging
+    paths:
+      - 'content/**'
+      - 'theme/design-tokens.json'
+  workflow_dispatch:
+    inputs:
+      deploy_all:
+        description: 'Deploy all pages (not just changed)'
+        required: false
+        default: 'false'
+        type: boolean
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Block production deployments
+        if: github.ref_name == 'main'
+        run: |
+          echo "ERROR: Production deployments are disabled until workflow is validated."
+          echo "Test on staging first, then uncomment 'main' in deploy.yml"
+          exit 1
+      
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get install -y jq
+          pip install phpserialize --break-system-packages -q
+      
+      - name: Determine environment
+        id: env
+        run: |
+          # TODO: Update these URLs to match your WordPress sites
+          if [[ "${{ github.ref_name }}" == "staging" ]]; then
+            echo "url=https://staging.example.com" >> $GITHUB_OUTPUT
+            echo "env_name=STAGING" >> $GITHUB_OUTPUT
+            echo "Deploying to STAGING"
+          else
+            echo "url=https://example.com" >> $GITHUB_OUTPUT
+            echo "env_name=PRODUCTION" >> $GITHUB_OUTPUT
+            echo "Deploying to PRODUCTION"
+          fi
+      
+      # ==========================================
+      # Theme Settings Deployment
+      # ==========================================
+      
+      - name: Check for theme settings changes
+        id: theme_changed
+        run: |
+          if git diff --name-only HEAD~1 HEAD | grep -q "^theme/design-tokens.json$"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "🎨 Theme design tokens changed"
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Generate and deploy theme settings
+        if: steps.theme_changed.outputs.changed == 'true'
+        env:
+          WP_USERNAME: ${{ secrets.USERNAME }}
+          WP_APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+        run: |
+          echo "🎨 Deploying theme settings to ${{ steps.env.outputs.env_name }}"
+          echo "========================================"
+          
+          # Generate the settings from design tokens
+          SETTINGS=$(python3 scripts/generate-theme-settings.py \
+            theme/design-tokens.json \
+            "${{ steps.env.outputs.url }}")
+          
+          if [[ -z "$SETTINGS" ]]; then
+            echo "❌ Failed to generate theme settings"
+            exit 1
+          fi
+          
+          echo "Generated settings (${#SETTINGS} bytes encoded)"
+          
+          # Deploy via REST API
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST "${{ steps.env.outputs.url }}/wp-json/enfold-gitops/v1/settings" \
+            --user "${WP_USERNAME}:${WP_APP_PASSWORD}" \
+            -H "Content-Type: application/json" \
+            -d "{\"settings\": \"$SETTINGS\"}")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+          
+          if [[ "$HTTP_CODE" -ge 200 && "$HTTP_CODE" -lt 300 ]]; then
+            echo "✅ Theme settings deployed successfully"
+            echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+          else
+            echo "❌ Theme settings deployment failed"
+            echo "HTTP Status: $HTTP_CODE"
+            echo "Response: $BODY"
+            exit 1
+          fi
+      
+      # ==========================================
+      # Content Deployment
+      # ==========================================
+      
+      - name: Get changed content files
+        id: changed
+        run: |
+          if [[ "${{ github.event.inputs.deploy_all }}" == "true" ]]; then
+            FILES=$(find content -name "*.txt" -type f | tr '\n' ' ')
+          else
+            FILES=$(git diff --name-only HEAD~1 HEAD -- 'content/' | grep '\.txt' | tr '\n' ' ' || echo "")
+          fi
+          echo "files=$FILES" >> $GITHUB_OUTPUT
+          echo "Changed files: $FILES"
+      
+      - name: Categorize files (new vs updates)
+        id: categorize
+        run: |
+          NEW_FILES=""
+          UPDATED_FILES=""
+          
+          for file in ${{ steps.changed.outputs.files }}; do
+            if [[ ! -f "$file" ]]; then
+              continue
+            fi
+            
+            # Extract basename and type from path
+            CONTENT_PATH="${file#content/}"
+            if [[ "$CONTENT_PATH" == *"/"* ]]; then
+              POST_TYPE="${CONTENT_PATH%%/*}"
+              BASENAME=$(basename "$file" .txt)
+            else
+              POST_TYPE="pages"
+              BASENAME=$(basename "$file" .txt)
+            fi
+            
+            # Map folder to meta type
+            case "$POST_TYPE" in
+              pages|page) META_TYPE="pages" ;;
+              posts|post) META_TYPE="posts" ;;
+              portfolio) META_TYPE="portfolio" ;;
+              layouts|alb_custom_layout) META_TYPE="layouts" ;;
+              *) META_TYPE="$POST_TYPE" ;;
+            esac
+            
+            # Check if meta file exists (indicates existing resource)
+            if [[ -f "meta/${META_TYPE}/${BASENAME}.json" ]] || [[ -f "meta/${BASENAME}.json" ]]; then
+              UPDATED_FILES="$UPDATED_FILES $file"
+            else
+              NEW_FILES="$NEW_FILES $file"
+            fi
+          done
+          
+          echo "new_files=$NEW_FILES" >> $GITHUB_OUTPUT
+          echo "updated_files=$UPDATED_FILES" >> $GITHUB_OUTPUT
+          echo ""
+          echo "📁 New files (to create): $NEW_FILES"
+          echo "♻️  Updated files (to deploy): $UPDATED_FILES"
+      
+      - name: Create new resources
+        id: create
+        if: steps.categorize.outputs.new_files != ''
+        env:
+          WP_USERNAME: ${{ secrets.USERNAME }}
+          WP_APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+        run: |
+          chmod +x scripts/create-wordpress-resource.sh
+          
+          echo "Creating new resources on ${{ steps.env.outputs.env_name }}"
+          echo "========================================"
+          
+          FAILED=0
+          CREATED_META_FILES=""
+          
+          for file in ${{ steps.categorize.outputs.new_files }}; do
+            if [[ -f "$file" ]]; then
+              echo "----------------------------------------"
+              echo "📝 Creating: $file"
+              
+              # Capture output to get meta file path
+              OUTPUT=$(./scripts/create-wordpress-resource.sh "$file" "${{ steps.env.outputs.url }}" "$WP_USERNAME" "$WP_APP_PASSWORD" 2>&1) || {
+                echo "$OUTPUT"
+                FAILED=1
+                continue
+              }
+              echo "$OUTPUT"
+              
+              # Extract meta file from output
+              META_FILE=$(echo "$OUTPUT" | grep "Meta:" | sed 's/.*Meta: //')
+              if [[ -n "$META_FILE" ]]; then
+                CREATED_META_FILES="$CREATED_META_FILES $META_FILE"
+              fi
+            fi
+          done
+          
+          echo "created_meta_files=$CREATED_META_FILES" >> $GITHUB_OUTPUT
+          
+          if [[ $FAILED -eq 1 ]]; then
+            echo "⚠️  Some creations failed"
+          fi
+      
+      - name: Deploy updated content
+        if: steps.categorize.outputs.updated_files != ''
+        env:
+          WP_USERNAME: ${{ secrets.USERNAME }}
+          WP_APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+        run: |
+          chmod +x scripts/deploy-content.sh
+          
+          echo "Deploying updates to ${{ steps.env.outputs.env_name }}"
+          echo "========================================"
+          
+          FAILED=0
+          for file in ${{ steps.categorize.outputs.updated_files }}; do
+            if [[ -f "$file" ]]; then
+              echo "----------------------------------------"
+              echo "♻️  Updating: $file"
+              if ! ./scripts/deploy-content.sh "$file" "${{ steps.env.outputs.url }}" "$WP_USERNAME" "$WP_APP_PASSWORD"; then
+                FAILED=1
+              fi
+            fi
+          done
+          
+          if [[ $FAILED -eq 1 ]]; then
+            echo "⚠️  Some deployments failed!"
+            exit 1
+          fi
+          
+          echo "========================================"
+          echo "✅ All updates completed successfully!"
+      
+      - name: Commit meta files for new resources
+        if: steps.create.outputs.created_meta_files != ''
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          
+          # Add all meta files
+          for meta_file in ${{ steps.create.outputs.created_meta_files }}; do
+            if [[ -f "$meta_file" ]]; then
+              git add "$meta_file"
+              echo "Added: $meta_file"
+            fi
+          done
+          
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "No meta files to commit"
+          else
+            git commit -m "chore: add WordPress IDs for new content [skip ci]"
+            git push
+            echo "✅ Committed meta files back to repository"
+          fi
+      
+      - name: No changes detected
+        if: steps.changed.outputs.files == '' && steps.theme_changed.outputs.changed != 'true'
+        run: echo "ℹ️  No content or theme files changed. Nothing to deploy."
+      
+      - name: Summary
+        if: always()
+        run: |
+          echo ""
+          echo "========================================"
+          echo "📊 Deployment Summary"
+          echo "========================================"
+          echo "Environment: ${{ steps.env.outputs.env_name }}"
+          echo "Theme settings: ${{ steps.theme_changed.outputs.changed == 'true' && '✅ deployed' || '⏭️  unchanged' }}"
+          echo "New files: ${{ steps.categorize.outputs.new_files || 'none' }}"
+          echo "Updated files: ${{ steps.categorize.outputs.updated_files || 'none' }}"
+          echo "========================================"

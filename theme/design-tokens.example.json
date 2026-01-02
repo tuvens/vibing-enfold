@@ -1,0 +1,36 @@
+{
+  "_meta": {
+    "description": "Enfold theme design tokens. Copy to design-tokens.json and customize.",
+    "generator": "scripts/generate-theme-settings.py",
+    "docs": "See README.md for customization options"
+  },
+  "brand": {
+    "name": "My Website",
+    "tagline": "Your tagline here"
+  },
+  "colors": {
+    "primary": "#3498db",
+    "secondary": "#2c3e50",
+    "accent": "#e74c3c",
+    "background": "#ffffff",
+    "background_alt": "#f8f8f8",
+    "text": "#333333",
+    "text_muted": "#777777",
+    "border": "#eeeeee"
+  },
+  "typography": {
+    "heading_font": "Montserrat:400,700",
+    "body_font": "Open Sans:400,400i,700",
+    "_note": "Use Google Font format or 'fontname-custom' for uploaded fonts"
+  },
+  "assets": {
+    "logo": "/wp-content/uploads/logo.png",
+    "favicon": "/wp-content/uploads/favicon.png",
+    "_note": "Relative paths from site root, or full URLs"
+  },
+  "features": {
+    "page_preloading": true,
+    "page_transitions": true,
+    "lightbox": true
+  }
+}
